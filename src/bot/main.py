@@ -51,11 +51,18 @@ async def on_ready():
 
 @bot.command(name=cmd_1)
 async def convert(ctx, *args):
-    message = ctx.message
+    message, owner, channel = ctx.message, ctx.message.author.mention, ctx.channel
+    if len(message.attachments) == 0 and message.reference:  # if the message is a reply to someone, use the file in the referenced message
+        if message.reference.resolved is None or type(message.reference.resolved) == type(discord.DeletedReferencedMessage):
+            await channel.send('The original message could not be found.')
+            return
+        else:
+            message_id = message.reference.message_id
+            message = await channel.fetch_message(message_id)
     if len(message.attachments) == 0:
-        await ctx.channel.send(f'No attachment found. Type `{prefix}{cmd_1}` in the message box and attach a replay file.')
+        await channel.send(f'No attachment found. Type `{prefix}{cmd_1}` in the message box and attach a replay file.')
     elif len(message.attachments) > 1:
-        await ctx.channel.send(f'More than one attachment found. `{prefix}{cmd_1}` accepts only one replay file at a time.')
+        await channel.send(f'More than one attachment found. `{prefix}{cmd_1}` accepts only one replay file at a time.')
     else:
         try:
             # Verify that the file header is correct
@@ -66,9 +73,9 @@ async def convert(ctx, *args):
             with open(file_path, 'rb') as f:
                 header = f.read(4)
                 if header != b'yrpX':
-                    await ctx.channel.send(f'Invalid or corrupted file. `{prefix}{cmd_1}` accepts .yrpX files only.')
+                    await channel.send(f'Invalid or corrupted file. `{prefix}{cmd_1}` accepts .yrpX files only.')
                     return False
-            await ctx.channel.send('Adding file to queue...')
+            await channel.send('Adding file to queue...')
 
             # Upload replay to S3
             response = s3.upload_file(file_path, BUCKET_NAME, f'{file_id}.yrpX')
@@ -79,15 +86,15 @@ async def convert(ctx, *args):
                 MessageBody=json.dumps({
                     'file_id': file_id,
                     'file_name': file_name,
-                    'owner': message.author.mention,
-                    'channel': ctx.channel.id
+                    'owner': owner,
+                    'channel': channel.id
                 }),
                 MessageDeduplicationId=file_id,
                 MessageGroupId='inbound'
             )
             global waiting_count
             waiting_count += 1
-            await ctx.channel.send(f'File `{file_name}` added to queue in position {waiting_count}.')
+            await channel.send(f'File `{file_name}` added to queue in position {waiting_count}.')
 
             # If necessary, increase autoscaling desired capacity to math.ceil(waiting_count/2)
             response = autoscaling.describe_auto_scaling_groups(
@@ -104,10 +111,10 @@ async def convert(ctx, *args):
                         DesiredCapacity=optimal_cap
                     )
                 if current_cap == 0:
-                    await ctx.channel.send(':alarm_clock: *Currently waking the servers from their nap. This request might take longer than usual to complete.*')
+                    await channel.send(':alarm_clock: *Currently waking the servers from their nap. This request might take longer than usual to complete.*')
 
         except Exception as e:
-            await ctx.channel.send(f'`An error occurred!\n{traceback.format_exc()}`')
+            await channel.send(f'`An error occurred!\n{traceback.format_exc()}`')
             print(f'{datetime.now()} - {traceback.format_exc()}')
 
 
@@ -134,10 +141,15 @@ async def send_outbound_videos():
                     waiting_count -= 1
                     response_json = json.loads(message['Body'])
                     file_id, file_name, owner, channel_id = response_json['file_id'], response_json['file_name'], response_json['owner'], response_json['channel']
-                    s3.download_file(BUCKET_NAME, f'{file_id}.mp4', f'/tmp/{file_id}.mp4')
                     await bot.wait_until_ready()
                     channel = bot.get_channel(channel_id)
-                    await channel.send(f'{owner}, your recording of `{file_name}` is ready.', file=discord.File(f'/tmp/{file_id}.mp4'))
+                    if file_id == '':
+                        # conversion timed out
+                        await channel.send(f'{owner} The conversion of `{file_name}` could not be completed. Please make sure the file is a valid EDOPro replay under ten minutes in length.')
+                    else:
+                        # conversion was successful
+                        s3.download_file(BUCKET_NAME, f'{file_id}.mp4', f'/tmp/{file_id}.mp4')
+                        await channel.send(f'{owner} Your recording of `{file_name}` is ready.', file=discord.File(f'/tmp/{file_id}.mp4'))
         except Exception as e:
             print(f'{datetime.now()} - {traceback.format_exc()}')
 
